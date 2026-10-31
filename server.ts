@@ -1,5 +1,6 @@
 import express from 'express';
 import http from 'http';
+import os from 'os';
 import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -12,9 +13,19 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+
+// Use noServer: true so Vite's internal middleware mode upgrade listener does not conflict with game WebSockets
+const wss = new WebSocketServer({ noServer: true });
 
 app.use(express.json());
+
+// Allow cross-origin LAN requests if accessed via different local hostname/IP
+app.use((_req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+});
 
 interface SurvivorState {
   id: string;
@@ -24,6 +35,7 @@ interface SurvivorState {
   rotation: [number, number]; // pitch, yaw
   action: string;
   health: number;
+  lastSeen: number;
 }
 
 interface StructureState {
@@ -35,22 +47,38 @@ interface StructureState {
   builtBy: string;
 }
 
+interface ChatEntry {
+  id: string;
+  sender: string;
+  color: string;
+  text: string;
+  time: number;
+}
+
 interface RoomState {
   code: string;
   hostId: string;
   survivors: Map<string, SurvivorState>;
   sockets: Map<string, WebSocket>;
   structures: StructureState[];
+  depletedNodes: Map<string, number>; // nodeId -> timestamp
+  chatHistory: ChatEntry[];
+  weather: 'clear' | 'rain' | 'radiation_storm';
   dnaIntegrity: number;
   dnaTemperature: number;
-  clonerStage: number; // 0 to 4 (0: None, 1: Cryo, 2: Bioreactor, 3: Gene Shifter, 4: RGSHSC Complete)
+  clonerStage: number; // 0 to 4
   createdAt: number;
 }
 
 const rooms = new Map<string, RoomState>();
 
+function normalizeRoomCode(code?: string): string {
+  const cleaned = (code || 'STRAND-1').trim().toUpperCase();
+  return cleaned === 'SOLO' ? 'STRAND-1' : cleaned || 'STRAND-1';
+}
+
 function getOrCreateRoom(code: string, hostId: string): RoomState {
-  const normalized = code.trim().toUpperCase() || 'ALPHA';
+  const normalized = normalizeRoomCode(code);
   let room = rooms.get(normalized);
   if (!room) {
     room = {
@@ -59,8 +87,11 @@ function getOrCreateRoom(code: string, hostId: string): RoomState {
       survivors: new Map(),
       sockets: new Map(),
       structures: [],
+      depletedNodes: new Map(),
+      chatHistory: [],
+      weather: 'clear',
       dnaIntegrity: 100,
-      dnaTemperature: -18, // Optimal cryogenic Celsius
+      dnaTemperature: -18,
       clonerStage: 0,
       createdAt: Date.now(),
     };
@@ -73,10 +104,50 @@ function broadcastToRoom(room: RoomState, message: object, excludeId?: string) {
   const data = JSON.stringify(message);
   for (const [survivorId, socket] of room.sockets.entries()) {
     if (survivorId !== excludeId && socket.readyState === WebSocket.OPEN) {
-      socket.send(data);
+      try {
+        socket.send(data);
+      } catch {
+        // Ignore broken pipe
+      }
     }
   }
 }
+
+// Periodically prune stale HTTP-polled or ghost survivors that haven't sent a heartbeat in 20 seconds
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of rooms.entries()) {
+    for (const [survivorId, survivor] of room.survivors.entries()) {
+      const ws = room.sockets.get(survivorId);
+      const isWsOpen = ws && ws.readyState === WebSocket.OPEN;
+      if (!isWsOpen && now - survivor.lastSeen > 20000) {
+        room.survivors.delete(survivorId);
+        room.sockets.delete(survivorId);
+        broadcastToRoom(room, {
+          type: 'survivor_left',
+          id: survivorId,
+        });
+      }
+    }
+    if (room.survivors.size === 0 && now - room.createdAt > 15 * 60 * 1000) {
+      rooms.delete(code);
+    }
+  }
+}, 5000);
+
+// Handle HTTP -> WebSocket upgrade on /ws (and fallback root if not vite-hmr)
+server.on('upgrade', (request, socket, head) => {
+  const protocol = request.headers['sec-websocket-protocol'] || '';
+  if (protocol.includes('vite-hmr')) {
+    return; // Let Vite handle HMR upgrades if enabled
+  }
+  const url = request.url || '/';
+  if (url.startsWith('/ws') || url === '/') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  }
+});
 
 wss.on('connection', (ws: WebSocket) => {
   let currentRoom: RoomState | null = null;
@@ -87,42 +158,63 @@ wss.on('connection', (ws: WebSocket) => {
       const msg = JSON.parse(raw.toString());
       switch (msg.type) {
         case 'join_room': {
-          const { roomCode, survivorName, color, id } = msg;
-          const survivorId = id || Math.random().toString(36).substring(2, 9);
+          const { roomCode, survivorName, color, id, position, rotation } = msg;
+          const survivorId = id || 'srv_' + Math.random().toString(36).substring(2, 9);
+
+          // If switching rooms on the same socket, remove from previous room first
+          if (currentRoom && currentSurvivorId && currentRoom.code !== normalizeRoomCode(roomCode)) {
+            currentRoom.survivors.delete(currentSurvivorId);
+            currentRoom.sockets.delete(currentSurvivorId);
+            broadcastToRoom(currentRoom, {
+              type: 'survivor_left',
+              id: currentSurvivorId,
+            });
+          }
+
           currentSurvivorId = survivorId;
           const room = getOrCreateRoom(roomCode, survivorId);
           currentRoom = room;
 
+          const existing = room.survivors.get(survivorId);
           const survivor: SurvivorState = {
             id: survivorId,
-            name: survivorName || `Survivor-${survivorId.slice(0, 4)}`,
-            color: color || '#06B6D4',
-            position: [0, 1.2, 5],
-            rotation: [0, 0],
+            name: (survivorName || existing?.name || `Survivor-${survivorId.slice(0, 4)}`).slice(0, 20),
+            color: color || existing?.color || '#06B6D4',
+            position: Array.isArray(position) && position.length === 3 ? position : existing?.position || [0, 1.65, 8],
+            rotation: Array.isArray(rotation) && rotation.length === 2 ? rotation : existing?.rotation || [0, 0],
             action: 'idle',
-            health: 100,
+            health: existing?.health ?? 100,
+            lastSeen: Date.now(),
           };
 
           room.survivors.set(survivorId, survivor);
           room.sockets.set(survivorId, ws);
 
-          // Send current state to newly joined survivor
-          ws.send(JSON.stringify({
-            type: 'init_state',
-            yourId: survivorId,
-            roomCode: room.code,
-            survivors: Array.from(room.survivors.values()),
-            structures: room.structures,
-            dnaIntegrity: room.dnaIntegrity,
-            dnaTemperature: room.dnaTemperature,
-            clonerStage: room.clonerStage,
-          }));
+          // Send current room state to newly joined survivor
+          ws.send(
+            JSON.stringify({
+              type: 'init_state',
+              yourId: survivorId,
+              roomCode: room.code,
+              survivors: Array.from(room.survivors.values()),
+              structures: room.structures,
+              chatHistory: room.chatHistory,
+              weather: room.weather,
+              dnaIntegrity: room.dnaIntegrity,
+              dnaTemperature: room.dnaTemperature,
+              clonerStage: room.clonerStage,
+            })
+          );
 
           // Notify other survivors in this room
-          broadcastToRoom(room, {
-            type: 'survivor_joined',
-            survivor,
-          }, survivorId);
+          broadcastToRoom(
+            room,
+            {
+              type: 'survivor_joined',
+              survivor,
+            },
+            survivorId
+          );
           break;
         }
 
@@ -130,24 +222,43 @@ wss.on('connection', (ws: WebSocket) => {
           if (!currentRoom || !currentSurvivorId) return;
           const survivor = currentRoom.survivors.get(currentSurvivorId);
           if (survivor) {
-            survivor.position = msg.position;
-            survivor.rotation = msg.rotation;
+            if (Array.isArray(msg.position) && msg.position.length === 3) {
+              survivor.position = msg.position;
+            }
+            if (Array.isArray(msg.rotation) && msg.rotation.length === 2) {
+              survivor.rotation = msg.rotation;
+            }
             survivor.action = msg.action || 'idle';
-            broadcastToRoom(currentRoom, {
-              type: 'survivor_moved',
-              id: currentSurvivorId,
-              position: msg.position,
-              rotation: msg.rotation,
-              action: msg.action,
-            }, currentSurvivorId);
+            if (typeof msg.health === 'number') {
+              survivor.health = Math.round(msg.health);
+            }
+            survivor.lastSeen = Date.now();
+
+            broadcastToRoom(
+              currentRoom,
+              {
+                type: 'survivor_moved',
+                id: currentSurvivorId,
+                name: survivor.name,
+                color: survivor.color,
+                position: survivor.position,
+                rotation: survivor.rotation,
+                action: survivor.action,
+                health: survivor.health,
+              },
+              currentSurvivorId
+            );
           }
           break;
         }
 
         case 'build_structure': {
-          if (!currentRoom) return;
+          if (!currentRoom || !msg.structure) return;
+          const structId = msg.structure.id || 'str_' + Math.random().toString(36).substring(2, 8);
+          if (currentRoom.structures.some((s) => s.id === structId)) break;
+
           const newStruct: StructureState = {
-            id: msg.structure.id || 'str_' + Math.random().toString(36).substring(2, 8),
+            id: structId,
             type: msg.structure.type,
             position: msg.structure.position,
             rotation: msg.structure.rotation || 0,
@@ -168,7 +279,8 @@ wss.on('connection', (ws: WebSocket) => {
 
         case 'upgrade_cloner': {
           if (!currentRoom) return;
-          const requestedStage = typeof msg.clonerStage === 'number' ? msg.clonerStage : (currentRoom.clonerStage || 0) + 1;
+          const requestedStage =
+            typeof msg.clonerStage === 'number' ? msg.clonerStage : (currentRoom.clonerStage || 0) + 1;
           const nextStage = Math.max(currentRoom.clonerStage || 0, Math.min(4, requestedStage));
           if (nextStage === currentRoom.clonerStage) break;
           currentRoom.clonerStage = nextStage;
@@ -184,37 +296,69 @@ wss.on('connection', (ws: WebSocket) => {
           break;
         }
 
+        case 'weather_change': {
+          if (!currentRoom || !msg.weather) return;
+          currentRoom.weather = msg.weather;
+          broadcastToRoom(
+            currentRoom,
+            {
+              type: 'weather_sync',
+              weather: currentRoom.weather,
+              changedBy: currentSurvivorId,
+            },
+            currentSurvivorId || undefined
+          );
+          break;
+        }
+
         case 'update_dna': {
           if (!currentRoom) return;
           if (typeof msg.dnaIntegrity === 'number') currentRoom.dnaIntegrity = msg.dnaIntegrity;
           if (typeof msg.dnaTemperature === 'number') currentRoom.dnaTemperature = msg.dnaTemperature;
-          broadcastToRoom(currentRoom, {
-            type: 'dna_sync',
-            dnaIntegrity: currentRoom.dnaIntegrity,
-            dnaTemperature: currentRoom.dnaTemperature,
-          }, currentSurvivorId || undefined);
+          broadcastToRoom(
+            currentRoom,
+            {
+              type: 'dna_sync',
+              dnaIntegrity: currentRoom.dnaIntegrity,
+              dnaTemperature: currentRoom.dnaTemperature,
+            },
+            currentSurvivorId || undefined
+          );
           break;
         }
 
         case 'resource_harvested': {
-          if (!currentRoom) return;
-          broadcastToRoom(currentRoom, {
-            type: 'resource_depleted',
-            nodeId: msg.nodeId,
-            harvestedBy: currentSurvivorId,
-          });
+          if (!currentRoom || !msg.nodeId) return;
+          currentRoom.depletedNodes.set(msg.nodeId, Date.now());
+          broadcastToRoom(
+            currentRoom,
+            {
+              type: 'resource_depleted',
+              nodeId: msg.nodeId,
+              harvestedBy: currentSurvivorId,
+            },
+            currentSurvivorId || undefined
+          );
           break;
         }
 
         case 'chat': {
-          if (!currentRoom || !currentSurvivorId) return;
+          if (!currentRoom || !currentSurvivorId || !msg.text) return;
           const survivor = currentRoom.survivors.get(currentSurvivorId);
+          const chatEntry: ChatEntry = {
+            id: msg.id || 'chat_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+            sender: survivor?.name || msg.sender || 'Survivor',
+            color: survivor?.color || msg.color || '#06B6D4',
+            text: String(msg.text).slice(0, 240),
+            time: Date.now(),
+          };
+          currentRoom.chatHistory.push(chatEntry);
+          if (currentRoom.chatHistory.length > 50) {
+            currentRoom.chatHistory.shift();
+          }
           broadcastToRoom(currentRoom, {
             type: 'chat_broadcast',
-            sender: survivor?.name || 'Survivor',
-            color: survivor?.color || '#06B6D4',
-            text: msg.text,
-            time: Date.now(),
+            ...chatEntry,
           });
           break;
         }
@@ -226,42 +370,193 @@ wss.on('connection', (ws: WebSocket) => {
 
   ws.on('close', () => {
     if (currentRoom && currentSurvivorId) {
-      currentRoom.survivors.delete(currentSurvivorId);
-      currentRoom.sockets.delete(currentSurvivorId);
-      broadcastToRoom(currentRoom, {
-        type: 'survivor_left',
-        id: currentSurvivorId,
-      });
-
-      if (currentRoom.survivors.size === 0) {
-        // Keep room alive for 15 minutes before cleanup
-        setTimeout(() => {
-          if (currentRoom && currentRoom.survivors.size === 0) {
-            rooms.delete(currentRoom.code);
-          }
-        }, 15 * 60 * 1000);
+      // Only delete if this socket is still the active socket for this survivorId
+      if (currentRoom.sockets.get(currentSurvivorId) === ws) {
+        currentRoom.sockets.delete(currentSurvivorId);
+        currentRoom.survivors.delete(currentSurvivorId);
+        broadcastToRoom(currentRoom, {
+          type: 'survivor_left',
+          id: currentSurvivorId,
+        });
       }
     }
   });
 });
 
-// REST API for room status and unity exporter metadata
+// ============================================================================
+// HTTP MULTIPLAYER SYNC & FALLBACK API (Works even if WS is blocked by a proxy)
+// ============================================================================
+
+app.post('/api/mp/sync', (req, res) => {
+  try {
+    const { roomCode, id, name, color, position, rotation, action, health } = req.body || {};
+    if (!id) {
+      res.status(400).json({ error: 'Missing survivor id' });
+      return;
+    }
+    const room = getOrCreateRoom(roomCode || 'STRAND-1', id);
+    const isNew = !room.survivors.has(id);
+    const existing = room.survivors.get(id);
+
+    const survivor: SurvivorState = {
+      id,
+      name: (name || existing?.name || `Survivor-${String(id).slice(0, 4)}`).slice(0, 20),
+      color: color || existing?.color || '#06B6D4',
+      position:
+        Array.isArray(position) && position.length === 3
+          ? position
+          : existing?.position || [0, 1.65, 8],
+      rotation:
+        Array.isArray(rotation) && rotation.length === 2
+          ? rotation
+          : existing?.rotation || [0, 0],
+      action: action || existing?.action || 'idle',
+      health: typeof health === 'number' ? Math.round(health) : existing?.health ?? 100,
+      lastSeen: Date.now(),
+    };
+
+    room.survivors.set(id, survivor);
+
+    if (isNew) {
+      broadcastToRoom(
+        room,
+        {
+          type: 'survivor_joined',
+          survivor,
+        },
+        id
+      );
+    } else {
+      broadcastToRoom(
+        room,
+        {
+          type: 'survivor_moved',
+          id: survivor.id,
+          name: survivor.name,
+          color: survivor.color,
+          position: survivor.position,
+          rotation: survivor.rotation,
+          action: survivor.action,
+          health: survivor.health,
+        },
+        id
+      );
+    }
+
+    res.json({
+      roomCode: room.code,
+      survivors: Array.from(room.survivors.values()),
+      structures: room.structures,
+      chatHistory: room.chatHistory,
+      weather: room.weather,
+      clonerStage: room.clonerStage,
+      dnaIntegrity: room.dnaIntegrity,
+      dnaTemperature: room.dnaTemperature,
+    });
+  } catch (err) {
+    console.error('HTTP /api/mp/sync error:', err);
+    res.status(500).json({ error: 'Internal sync error' });
+  }
+});
+
+app.post('/api/mp/event', (req, res) => {
+  try {
+    const { roomCode, id, type, structure, clonerStage, weather, text, sender, color, nodeId } = req.body || {};
+    const room = getOrCreateRoom(roomCode || 'STRAND-1', id || 'host');
+
+    if (type === 'build_structure' && structure) {
+      const structId = structure.id || 'str_' + Math.random().toString(36).substring(2, 8);
+      if (!room.structures.some((s) => s.id === structId)) {
+        const newStruct: StructureState = {
+          id: structId,
+          type: structure.type,
+          position: structure.position,
+          rotation: structure.rotation || 0,
+          health: 100,
+          builtBy: id || 'unknown',
+        };
+        room.structures.push(newStruct);
+        broadcastToRoom(room, { type: 'structure_added', structure: newStruct }, id);
+      }
+    } else if (type === 'upgrade_cloner' && typeof clonerStage === 'number') {
+      if (clonerStage > room.clonerStage) {
+        room.clonerStage = Math.min(4, clonerStage);
+        broadcastToRoom(room, { type: 'cloner_upgraded', clonerStage: room.clonerStage, upgradedBy: id }, id);
+      }
+    } else if (type === 'weather_change' && weather) {
+      room.weather = weather;
+      broadcastToRoom(room, { type: 'weather_sync', weather: room.weather, changedBy: id }, id);
+    } else if (type === 'resource_harvested' && nodeId) {
+      room.depletedNodes.set(nodeId, Date.now());
+      broadcastToRoom(room, { type: 'resource_depleted', nodeId, harvestedBy: id }, id);
+    } else if (type === 'chat' && text) {
+      const survivor = id ? room.survivors.get(id) : undefined;
+      const chatEntry: ChatEntry = {
+        id: 'chat_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+        sender: survivor?.name || sender || 'Survivor',
+        color: survivor?.color || color || '#06B6D4',
+        text: String(text).slice(0, 240),
+        time: Date.now(),
+      };
+      room.chatHistory.push(chatEntry);
+      if (room.chatHistory.length > 50) room.chatHistory.shift();
+      broadcastToRoom(room, { type: 'chat_broadcast', ...chatEntry });
+    } else if (type === 'leave' && id) {
+      room.survivors.delete(id);
+      room.sockets.delete(id);
+      broadcastToRoom(room, { type: 'survivor_left', id });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('HTTP /api/mp/event error:', err);
+    res.status(500).json({ error: 'Event error' });
+  }
+});
+
+// Helper to discover local LAN IPv4 addresses for Local Network Multiplayer
+function getLocalLanAddresses(port: number | string): string[] {
+  const urls: string[] = [];
+  try {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+      for (const iface of interfaces[name] || []) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          urls.push(`http://${iface.address}:${port}`);
+        }
+      }
+    }
+  } catch {
+    // Ignore os interface errors
+  }
+  return urls;
+}
+
+// REST API for room status, LAN discovery, and unity exporter metadata
 app.get('/api/status', (_req, res) => {
+  const PORT = process.env.PORT || 3000;
   res.json({
     activeRooms: rooms.size,
     totalSurvivors: Array.from(rooms.values()).reduce((sum, r) => sum + r.survivors.size, 0),
+    lanUrls: getLocalLanAddresses(PORT),
   });
 });
 
 app.get('/api/rooms', (_req, res) => {
-  const roomList = Array.from(rooms.values()).map(r => ({
+  const PORT = process.env.PORT || 3000;
+  const roomList = Array.from(rooms.values()).map((r) => ({
     code: r.code,
     survivorsCount: r.survivors.size,
+    survivorNames: Array.from(r.survivors.values()).map((s) => s.name),
     structuresCount: r.structures.length,
     clonerStage: r.clonerStage,
     dnaIntegrity: r.dnaIntegrity,
+    weather: r.weather,
   }));
-  res.json(roomList);
+  res.json({
+    rooms: roomList,
+    lanUrls: getLocalLanAddresses(PORT),
+  });
 });
 
 // Serve Unity C# Script Package contents
@@ -445,8 +740,8 @@ public class ModularBaseBuilding : MonoBehaviour
 6. Attach \`RGSHSC_ClonerMachine.cs\` to the exported RGSHSC 3D model.
 7. Press Play! You now have the exact base-building, DNA preservation, and RGSHSC cloning loop in Unity.
 `,
-      }
-    ]
+      },
+    ],
   });
 });
 
@@ -468,9 +763,14 @@ async function startServer() {
     });
   }
 
-  const PORT = process.env.PORT || 3000;
-  server.listen(PORT, () => {
-    console.log(`RGSHSC Server running on port ${PORT} [${isDev ? 'development' : 'production'}]`);
+  const PORT = Number(process.env.PORT) || 3000;
+  // Bind to 0.0.0.0 so devices across the local network (LAN) can connect to port 3000
+  server.listen(PORT, '0.0.0.0', () => {
+    const lanUrls = getLocalLanAddresses(PORT);
+    console.log(`RGSHSC Server running on http://0.0.0.0:${PORT} [${isDev ? 'development' : 'production'}]`);
+    if (lanUrls.length > 0) {
+      console.log(`Local Network (LAN) Multiplayer URLs: ${lanUrls.join(', ')}`);
+    }
   });
 }
 

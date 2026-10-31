@@ -53,6 +53,52 @@ interface ModelStudioModalProps {
   onImportWorldMapJson: (file: File) => Promise<void>;
 }
 
+export interface Sample3DMapLink {
+  id: string;
+  label: string;
+  subtitle: string;
+  format: 'GLB' | 'GLTF';
+  url: string;
+}
+
+export const SAMPLE_3D_MAP_LINKS: Sample3DMapLink[] = [
+  {
+    id: 'collision_world',
+    label: 'FPS Collision Arena Map',
+    subtitle: 'Walkable 3D level with stairs, ramps, arches & platforms (Three.js Official)',
+    format: 'GLB',
+    url: 'https://threejs.org/examples/models/gltf/collision-world.glb',
+  },
+  {
+    id: 'virtual_city',
+    label: 'Futuristic Virtual City Sector',
+    subtitle: 'Full 3D sci-fi city blocks, streets & plazas (Khronos Group Sample)',
+    format: 'GLB',
+    url: 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/VC/glTF-Binary/VC.glb',
+  },
+  {
+    id: 'littlest_tokyo',
+    label: 'Cyberpunk Tokyo Block Diorama',
+    subtitle: 'Detailed multi-story neon urban block environment (Three.js Official)',
+    format: 'GLB',
+    url: 'https://threejs.org/examples/models/gltf/LittlestTokyo.glb',
+  },
+  {
+    id: 'sponza_palace',
+    label: 'Sponza Courtyard Citadel',
+    subtitle: 'Multi-tier colonnade courtyard & arches (Khronos Architectural Map)',
+    format: 'GLTF',
+    url: 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Sponza/glTF/Sponza.gltf',
+  },
+  {
+    id: 'sci_fi_outpost_spire',
+    label: 'Outpost Spire Landmark Sector',
+    subtitle: 'Elevated sci-fi beacon & structural base plaza (Khronos Sample)',
+    format: 'GLB',
+    url: 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Lantern/glTF-Binary/Lantern.glb',
+  },
+];
+
 export const ModelStudioModal: React.FC<ModelStudioModalProps> = ({
   isOpen,
   initialCategory = 'map',
@@ -569,7 +615,7 @@ export const ModelStudioModal: React.FC<ModelStudioModalProps> = ({
                   className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 text-xs font-medium flex items-center gap-1.5 cursor-pointer transition-colors"
                 >
                   <Link2 className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>{showUrlInput ? 'Hide URL Loader' : 'Load from URL'}</span>
+                  <span>{showUrlInput ? 'Hide 3D Map & Model Links' : 'Load from URL / Sample Links'}</span>
                 </button>
 
                 <button
@@ -584,13 +630,13 @@ export const ModelStudioModal: React.FC<ModelStudioModalProps> = ({
               </div>
 
               {showUrlInput && (
-                <div className="space-y-2 p-2.5 rounded-xl bg-slate-900/90 border border-slate-800">
+                <div className="space-y-2.5 p-2.5 rounded-xl bg-slate-900/90 border border-slate-800">
                   <form onSubmit={handleUrlLoad} className="flex gap-2">
                     <input
                       type="url"
                       value={urlInput}
                       onChange={(e) => setUrlInput(e.target.value)}
-                      placeholder="https://raw.githubusercontent.com/.../model.glb"
+                      placeholder="https://threejs.org/examples/models/gltf/collision-world.glb"
                       className="flex-1 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs text-white focus:outline-none focus:border-cyan-500 font-mono-nums"
                     />
                     <button
@@ -602,7 +648,41 @@ export const ModelStudioModal: React.FC<ModelStudioModalProps> = ({
                   </form>
 
                   <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                    <span className="text-[10px] text-slate-400 mr-1">Quick Test Links:</span>
+                    <span className="text-[10px] text-cyan-300 font-semibold mr-1">Sample 3D Maps:</span>
+                    {SAMPLE_3D_MAP_LINKS.map((sample) => (
+                      <button
+                        key={sample.id}
+                        type="button"
+                        onClick={async () => {
+                          setSelectedSlotId('world_map');
+                          setActiveCategory('map');
+                          setUrlInput(sample.url);
+                          setIsLoadingFile(true);
+                          setErrorMsg(null);
+                          try {
+                            const { result, fileName } = await customModelRegistry.parseUrl(sample.url);
+                            const nextTransform: CustomModelTransform = { ...DEFAULT_MODEL_TRANSFORM };
+                            setPendingParsed(result);
+                            setPendingFileName(fileName);
+                            setTransform(nextTransform);
+                            customModelRegistry.registerCustomModel('world_map', fileName, result, nextTransform);
+                            onApplyModelToWorld('world_map', fileName);
+                            showTempBanner(`Loaded 3D Map "${sample.label}" (${fileName}) into the world!`);
+                          } catch (err: any) {
+                            setErrorMsg(err?.message || 'Failed to load sample 3D map URL.');
+                          } finally {
+                            setIsLoadingFile(false);
+                          }
+                        }}
+                        className="px-2 py-1 rounded bg-cyan-950/60 hover:bg-cyan-500/25 hover:text-cyan-200 border border-cyan-500/40 text-[10px] text-cyan-300 transition-colors cursor-pointer"
+                      >
+                        🗺️ {sample.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-slate-800/80">
+                    <span className="text-[10px] text-slate-400 mr-1">Sample Props/Avatars:</span>
                     {[
                       {
                         label: 'Sci-Fi Damaged Helmet',
@@ -745,7 +825,7 @@ export const ModelStudioModal: React.FC<ModelStudioModalProps> = ({
           {/* Column 3: Scale, Rotation, Grounding, Map Importer & PBR Material Inspector (4 cols) */}
           <div className="lg:col-span-4 flex flex-col justify-between min-h-0 bg-slate-900/90">
             <div className="flex-1 overflow-y-auto p-4 space-y-5">
-              {/* Special Section when 'world_map' is selected: Heightmap Image, JSON Map & Biome Presets */}
+              {/* Special Section when 'world_map' is selected: Sample 3D Map Links, Heightmap Image, JSON Map & Biome Presets */}
               {selectedSlotId === 'world_map' && (
                 <div className="p-3.5 rounded-xl bg-slate-950/90 border border-cyan-500/40 space-y-3">
                   <div className="flex items-center justify-between border-b border-slate-800 pb-2">
@@ -756,6 +836,92 @@ export const ModelStudioModal: React.FC<ModelStudioModalProps> = ({
                     <span className="text-[10px] font-mono-nums px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300">
                       180m × 180m Sector
                     </span>
+                  </div>
+
+                  {/* Sample 3D Map Links (.GLB / .GLTF) */}
+                  <div className="p-2.5 rounded-xl bg-slate-900/95 border border-cyan-500/30 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-cyan-300 flex items-center gap-1.5">
+                        <Link2 className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Sample 3D Map Links (.GLB / .GLTF)</span>
+                      </span>
+                      <span className="text-[10px] text-slate-400 font-mono-nums">1-Click Load or Copy</span>
+                    </div>
+
+                    <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+                      {SAMPLE_3D_MAP_LINKS.map((sample) => (
+                        <div
+                          key={sample.id}
+                          className="p-2 rounded-lg bg-slate-950/90 border border-slate-800 hover:border-cyan-500/40 transition-colors space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold text-white truncate">
+                              {sample.label}
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 text-[9px] font-mono-nums font-bold shrink-0">
+                              .{sample.format}
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-slate-400 leading-tight">
+                            {sample.subtitle}
+                          </p>
+                          <div className="text-[10px] font-mono-nums text-cyan-400/90 bg-slate-900/90 px-2 py-1 rounded border border-slate-800/90 truncate select-all">
+                            {sample.url}
+                          </div>
+                          <div className="flex items-center gap-1.5 pt-0.5">
+                            <button
+                              type="button"
+                              disabled={isLoadingFile}
+                              onClick={async () => {
+                                setUrlInput(sample.url);
+                                setIsLoadingFile(true);
+                                setErrorMsg(null);
+                                try {
+                                  const { result, fileName } = await customModelRegistry.parseUrl(sample.url);
+                                  const nextTransform: CustomModelTransform = { ...DEFAULT_MODEL_TRANSFORM };
+                                  setPendingParsed(result);
+                                  setPendingFileName(fileName);
+                                  setTransform(nextTransform);
+                                  customModelRegistry.registerCustomModel('world_map', fileName, result, nextTransform);
+                                  onApplyModelToWorld('world_map', fileName);
+                                  showTempBanner(`Loaded 3D Map "${sample.label}" into live sector!`);
+                                } catch (err: any) {
+                                  setErrorMsg(err?.message || 'Failed to load sample 3D map.');
+                                } finally {
+                                  setIsLoadingFile(false);
+                                }
+                              }}
+                              className="flex-1 py-1 px-2 rounded bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-[10px] transition-colors cursor-pointer text-center"
+                            >
+                              {isLoadingFile && urlInput === sample.url ? 'Loading 3D Map...' : 'Load 3D Map in Game'}
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setUrlInput(sample.url);
+                                setShowUrlInput(true);
+                                navigator.clipboard?.writeText(sample.url).catch(() => {});
+                                showTempBanner(`Copied 3D Map URL: ${sample.label}`);
+                              }}
+                              className="py-1 px-2 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-[10px] transition-colors cursor-pointer"
+                            >
+                              Copy Link
+                            </button>
+
+                            <a
+                              href={sample.url}
+                              download
+                              target="_blank"
+                              rel="noreferrer"
+                              className="py-1 px-2 rounded bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-emerald-300 font-semibold text-[10px] transition-colors"
+                            >
+                              .GLB File
+                            </a>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
 
                   {/* Hidden File Inputs for Heightmap (.png/.jpg) and World Map (.json) */}

@@ -821,18 +821,78 @@ export function createRGSHSCCoreMesh(stage: number = 4): THREE.Group {
   return group;
 }
 
+// Helper to build a crisp floating 3D nameplate sprite above remote co-op survivors
+export function createSurvivorNameplateSprite(name: string, color: string): THREE.Sprite {
+  const canvas = document.createElement('canvas');
+  canvas.width = 512;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d')!;
+
+  ctx.clearRect(0, 0, 512, 128);
+
+  // Dark rounded HUD plate
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+  ctx.strokeStyle = color || '#06B6D4';
+  ctx.lineWidth = 6;
+  ctx.beginPath();
+  ctx.roundRect(16, 20, 480, 88, 20);
+  ctx.fill();
+  ctx.stroke();
+
+  // Suit color status dot
+  ctx.fillStyle = color || '#06B6D4';
+  ctx.beginPath();
+  ctx.arc(58, 64, 14, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Callsign text
+  ctx.fillStyle = '#f8fafc';
+  ctx.font = 'bold 36px monospace';
+  ctx.textBaseline = 'middle';
+  ctx.fillText((name || 'SURVIVOR').slice(0, 18), 90, 64);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    transparent: true,
+    depthTest: false,
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.name = 'survivorNameplate';
+  sprite.scale.set(1.8, 0.45, 1);
+  sprite.position.set(0, 2.15, 0);
+  return sprite;
+}
+
 // 15. Survivor Remote Avatar (for multiplayer co-op survivors)
-export function createSurvivorAvatarMesh(color: string = '#06B6D4', ignoreCustom: boolean = false): THREE.Group {
+export function createSurvivorAvatarMesh(
+  color: string = '#06B6D4',
+  ignoreCustom: boolean = false,
+  name: string = 'Survivor'
+): THREE.Group {
   if (!ignoreCustom) {
     const custom = customModelRegistry.createCustomInstance('survivor_avatar');
-    if (custom) return custom;
+    if (custom) {
+      const label = createSurvivorNameplateSprite(name, color);
+      custom.add(label);
+      custom.userData = { survivorName: name, survivorColor: color };
+      return custom;
+    }
   }
   const group = new THREE.Group();
+  group.userData = { survivorName: name, survivorColor: color };
 
   const suitColor = new THREE.Color(color);
-  const suitMat = new THREE.MeshStandardMaterial({ color: suitColor, roughness: 0.6, metalness: 0.2 });
+  const suitMat = new THREE.MeshStandardMaterial({ color: suitColor, roughness: 0.5, metalness: 0.25 });
   const darkMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.8, metalness: 0.3 });
-  const visorMat = new THREE.MeshPhysicalMaterial({ color: 0xf59e0b, roughness: 0.1, metalness: 0.9 });
+  const visorMat = new THREE.MeshPhysicalMaterial({
+    color: 0xf59e0b,
+    emissive: 0xd97706,
+    emissiveIntensity: 0.25,
+    roughness: 0.1,
+    metalness: 0.9,
+  });
 
   // Torso
   const torsoGeom = new THREE.BoxGeometry(0.5, 0.65, 0.3);
@@ -841,19 +901,31 @@ export function createSurvivorAvatarMesh(color: string = '#06B6D4', ignoreCustom
   torso.castShadow = true;
   group.add(torso);
 
-  // Life-Support Backpack
+  // Glowing Chest Beacon (makes co-op allies easy to spot day or night)
+  const beaconGeom = new THREE.CylinderGeometry(0.08, 0.08, 0.04, 12);
+  const beaconMat = new THREE.MeshStandardMaterial({
+    color: suitColor,
+    emissive: suitColor,
+    emissiveIntensity: 1.1,
+  });
+  const chestBeacon = new THREE.Mesh(beaconGeom, beaconMat);
+  chestBeacon.rotation.x = Math.PI / 2;
+  chestBeacon.position.set(0, 1.12, -0.16);
+  group.add(chestBeacon);
+
+  // Life-Support Backpack (on +Z back since camera looks down -Z)
   const packGeom = new THREE.BoxGeometry(0.35, 0.5, 0.2);
   const pack = new THREE.Mesh(packGeom, darkMat);
-  pack.position.set(0, 1.1, -0.22);
+  pack.position.set(0, 1.1, 0.22);
   group.add(pack);
 
   // Oxygen cylinders (2)
   const cylGeom = new THREE.CylinderGeometry(0.06, 0.06, 0.45, 8);
   const cylMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.8 });
   const c1 = new THREE.Mesh(cylGeom, cylMat);
-  c1.position.set(0.1, 1.1, -0.32);
+  c1.position.set(0.1, 1.1, 0.32);
   const c2 = new THREE.Mesh(cylGeom, cylMat);
-  c2.position.set(-0.1, 1.1, -0.32);
+  c2.position.set(-0.1, 1.1, 0.32);
   group.add(c1, c2);
 
   // Helmet
@@ -863,27 +935,53 @@ export function createSurvivorAvatarMesh(color: string = '#06B6D4', ignoreCustom
   helmet.castShadow = true;
   group.add(helmet);
 
-  // Gold reflective visor
+  // Gold reflective visor (facing forward -Z to match playerYaw forward vector)
   const visorGeom = new THREE.BoxGeometry(0.28, 0.14, 0.08);
   const visor = new THREE.Mesh(visorGeom, visorMat);
-  visor.position.set(0, 1.55, 0.18);
+  visor.position.set(0, 1.55, -0.18);
   group.add(visor);
 
-  // Legs & Boots
+  // Articulated Legs & Boots
   const legGeom = new THREE.BoxGeometry(0.18, 0.65, 0.2);
   const leftLeg = new THREE.Mesh(legGeom, darkMat);
-  leftLeg.position.set(-0.14, 0.4, 0);
+  leftLeg.name = 'leftLeg';
+  leftLeg.position.set(-0.14, 0.35, 0);
   const rightLeg = new THREE.Mesh(legGeom, darkMat);
-  rightLeg.position.set(0.14, 0.4, 0);
+  rightLeg.name = 'rightLeg';
+  rightLeg.position.set(0.14, 0.35, 0);
   group.add(leftLeg, rightLeg);
 
-  // Arms
+  // Articulated Arms
   const armGeom = new THREE.BoxGeometry(0.14, 0.6, 0.16);
   const leftArm = new THREE.Mesh(armGeom, suitMat);
+  leftArm.name = 'leftArm';
   leftArm.position.set(-0.35, 1.0, 0);
-  const rightArm = new THREE.Mesh(armGeom, suitMat);
+
+  const rightArm = new THREE.Group();
+  rightArm.name = 'rightArm';
   rightArm.position.set(0.35, 1.0, 0);
+  const rightArmMesh = new THREE.Mesh(armGeom, suitMat);
+  rightArm.add(rightArmMesh);
+
+  // Mini Pickaxe in right hand so remote allies visibly carry their Pickaxe
+  const miniShaft = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.02, 0.02, 0.55, 8),
+    new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.7 })
+  );
+  miniShaft.rotation.x = Math.PI / 2;
+  miniShaft.position.set(0, -0.22, -0.22);
+  const miniHead = new THREE.Mesh(
+    new THREE.BoxGeometry(0.04, 0.28, 0.05),
+    new THREE.MeshStandardMaterial({ color: 0x06b6d4, emissive: 0x0891b2, emissiveIntensity: 0.5 })
+  );
+  miniHead.position.set(0, -0.22, -0.45);
+  rightArm.add(miniShaft, miniHead);
+
   group.add(leftArm, rightArm);
+
+  // Floating 3D Callsign Nameplate above helmet
+  const nameplate = createSurvivorNameplateSprite(name, color);
+  group.add(nameplate);
 
   return group;
 }

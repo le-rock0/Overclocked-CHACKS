@@ -5,6 +5,7 @@ import {
   EquippedItem,
   Inventory,
   ModelSlotId,
+  RemoteSurvivor,
   ResourceNode,
   ResourceType,
   StructureItem,
@@ -34,9 +35,11 @@ export interface EngineCallbacks {
   onVitalsChange: (vitals: SurvivorVitals) => void;
   onInventoryChange: (inv: Inventory) => void;
   onHoverTargetChange: (targetText: string | null) => void;
-  onLocalPlayerMove: (pos: [number, number, number], rot: [number, number], action: string) => void;
+  onLocalPlayerMove: (pos: [number, number, number], rot: [number, number], action: string, health: number) => void;
   onStructureBuilt: (structure: StructureItem) => void;
   onClonerProgress: (stage: number) => void;
+  onResourceHarvested?: (nodeId: string) => void;
+  onWeatherBroadcast?: (weather: WeatherType) => void;
   onHumanityRestored: () => void;
   onHumanityExtinct?: (reason: 'health' | 'dna') => void;
   onNotification: (text: string, type?: 'info' | 'warn' | 'success') => void;
@@ -46,6 +49,16 @@ export interface EngineCallbacks {
   onWaterCollected?: () => void;
   onBuildModeChange?: (type: StructureType | null) => void;
   onWeatherChange?: (telemetry: WeatherTelemetry) => void;
+}
+
+interface RemoteAvatarEntry {
+  mesh: THREE.Group;
+  name: string;
+  color: string;
+  targetPos: THREE.Vector3;
+  targetYaw: number;
+  action: string;
+  walkPhase: number;
 }
 
 export class ThreeEngine {
@@ -81,6 +94,8 @@ export class ThreeEngine {
   private headBobTimer: number = 0;
   private cameraShake: number = 0;
   private hitstopTimer: number = 0;
+  private lastNetBroadcastTime: number = 0;
+  private localHarvestActionTimer: number = 0;
 
   // Keys held
   private keysHeld = new Set<string>();
@@ -88,7 +103,7 @@ export class ThreeEngine {
   // World collections
   private resourceNodes: Map<string, { node: ResourceNode; mesh: THREE.Group }> = new Map();
   private structures: Map<string, { item: StructureItem; mesh: THREE.Group }> = new Map();
-  private remoteAvatars: Map<string, THREE.Group> = new Map();
+  private remoteAvatars: Map<string, RemoteAvatarEntry> = new Map();
   private terrainMesh: THREE.Mesh | null = null;
   private perimeterRocks: THREE.Mesh[] = [];
   private customMapGroup: THREE.Group | null = null;
@@ -864,23 +879,161 @@ export class ThreeEngine {
     items.forEach((item) => this.addStructureMesh(item));
   }
 
-  public updateRemoteSurvivor(id: string, name: string, color: string, pos: [number, number, number], rot: [number, number]) {
-    let avatar = this.remoteAvatars.get(id);
-    if (!avatar) {
-      avatar = createSurvivorAvatarMesh(color);
-      this.scene.add(avatar);
-      this.remoteAvatars.set(id, avatar);
+  public getLocalPlayerTransform(): { position: [number, number, number]; rotation: [number, number] } {
+    return {
+      position: [this.playerPos.x, this.playerPos.y, this.playerPos.z],
+      rotation: [this.playerPitch, this.playerYaw],
+    };
+  }
+
+  public teleportToPosition(pos: [number, number, number]) {
+    const offsetX = pos[0] + 1.8;
+    const offsetZ = pos[2] + 1.8;
+    const groundY = this.groundHeightAt(offsetX, offsetZ) + 1.65;
+    this.playerPos.set(offsetX, groundY, offsetZ);
+    this.playerVelocity.set(0, 0, 0);
+    this.camera.position.copy(this.playerPos);
+    // Face toward the ally
+    this.playerYaw = Math.atan2(offsetX - pos[0], offsetZ - pos[2]);
+    sound.playCraftComplete();
+  }
+
+  public updateRemoteSurvivor(
+    id: string,
+    name: string,
+    color: string,
+    pos: [number, number, number],
+    rot: [number, number],
+    action: string = 'idle'
+  ) {
+    const safeName = name || 'Survivor';
+    const safeColor = color || '#06B6D4';
+
+    // Convert camera eye height (y = ground + 1.65) to avatar foot ground height (y = ground)
+    const groundY = this.groundHeightAt(pos[0], pos[2]);
+    const footY = Math.max(groundY, (pos[1] ?? groundY + 1.65) - 1.65);
+
+    let entry = this.remoteAvatars.get(id);
+    if (!entry || entry.name !== safeName || entry.color !== safeColor) {
+      if (entry) {
+        this.scene.remove(entry.mesh);
+      }
+      const mesh = createSurvivorAvatarMesh(safeColor, false, safeName);
+      mesh.position.set(pos[0], footY, pos[2]);
+      mesh.rotation.y = rot[1] || 0;
+      this.scene.add(mesh);
+      entry = {
+        mesh,
+        name: safeName,
+        color: safeColor,
+        targetPos: new THREE.Vector3(pos[0], footY, pos[2]),
+        targetYaw: rot[1] || 0,
+        action,
+        walkPhase: 0,
+      };
+      this.remoteAvatars.set(id, entry);
+    } else {
+      entry.targetPos.set(pos[0], footY, pos[2]);
+      entry.targetYaw = rot[1] || 0;
+      entry.action = action || 'idle';
     }
-    avatar.position.set(pos[0], pos[1], pos[2]);
-    avatar.rotation.y = rot[1];
+  }
+
+  public syncAllRemoteSurvivors(survivors: RemoteSurvivor[]) {
+    const activeIds = new Set<string>();
+    for (const s of survivors) {
+      activeIds.add(s.id);
+      this.updateRemoteSurvivor(
+        s.id,
+        s.name,
+        s.color,
+        s.position || [0, 1.65, 8],
+        s.rotation || [0, 0],
+        s.action || 'idle'
+      );
+    }
+    // Remove any avatars that left the room
+    for (const existingId of Array.from(this.remoteAvatars.keys())) {
+      if (!activeIds.has(existingId)) {
+        this.removeRemoteSurvivor(existingId);
+      }
+    }
+  }
+
+  public clearRemoteSurvivors() {
+    for (const id of Array.from(this.remoteAvatars.keys())) {
+      this.removeRemoteSurvivor(id);
+    }
   }
 
   public removeRemoteSurvivor(id: string) {
-    const avatar = this.remoteAvatars.get(id);
-    if (avatar) {
-      this.scene.remove(avatar);
+    const entry = this.remoteAvatars.get(id);
+    if (entry) {
+      this.scene.remove(entry.mesh);
       this.remoteAvatars.delete(id);
     }
+  }
+
+  private updateRemoteAvatarsAnimation(dt: number) {
+    const lerpFactor = Math.min(1, dt * 12);
+    this.remoteAvatars.forEach((entry) => {
+      const distSq = entry.mesh.position.distanceToSquared(entry.targetPos);
+      // If very far (>25m), snap immediately; otherwise smoothly interpolate
+      if (distSq > 625) {
+        entry.mesh.position.copy(entry.targetPos);
+      } else {
+        entry.mesh.position.lerp(entry.targetPos, lerpFactor);
+      }
+
+      // Smoothly interpolate Y rotation (handling angle wrap-around)
+      let diff = entry.targetYaw - entry.mesh.rotation.y;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      entry.mesh.rotation.y += diff * lerpFactor;
+
+      // Animate legs and arms when moving or harvesting
+      const isMoving = distSq > 0.0025 || entry.action === 'walk';
+      const leftLeg = entry.mesh.getObjectByName('leftLeg');
+      const rightLeg = entry.mesh.getObjectByName('rightLeg');
+      const leftArm = entry.mesh.getObjectByName('leftArm');
+      const rightArm = entry.mesh.getObjectByName('rightArm');
+
+      if (isMoving) {
+        entry.walkPhase += dt * 10;
+        const swing = Math.sin(entry.walkPhase) * 0.55;
+        if (leftLeg) leftLeg.rotation.x = swing;
+        if (rightLeg) rightLeg.rotation.x = -swing;
+        if (leftArm) leftArm.rotation.x = -swing * 0.7;
+        if (rightArm && entry.action !== 'harvest') rightArm.rotation.x = swing * 0.7;
+      } else {
+        if (leftLeg) leftLeg.rotation.x *= 0.8;
+        if (rightLeg) rightLeg.rotation.x *= 0.8;
+        if (leftArm) leftArm.rotation.x *= 0.8;
+        if (rightArm && entry.action !== 'harvest') rightArm.rotation.x *= 0.8;
+      }
+
+      if (rightArm && entry.action === 'harvest') {
+        entry.walkPhase += dt * 18;
+        rightArm.rotation.x = -0.6 + Math.sin(entry.walkPhase) * 0.65;
+      }
+    });
+  }
+
+  public depleteRemoteResourceNode(nodeId: string) {
+    const entry = this.resourceNodes.get(nodeId);
+    if (!entry || entry.node.depleted) return;
+    if (entry.node.type === 'biomass') {
+      this.scene.remove(entry.mesh);
+      this.resourceNodes.delete(nodeId);
+      this.spawnRandomBiomassNode(false);
+      return;
+    }
+    const regenSecs = this.getRegenDurationForType(entry.node.type);
+    entry.node.depleted = true;
+    entry.node.health = 0;
+    entry.node.respawnDuration = regenSecs;
+    entry.node.respawnTimer = regenSecs;
+    entry.mesh.scale.set(0.18, 0.18, 0.18);
   }
 
   /**
@@ -955,16 +1108,17 @@ export class ThreeEngine {
 
     // 3. Check if slotId is the survivor character avatar
     if (slotId === 'survivor_avatar') {
-      this.remoteAvatars.forEach((oldAvatar, id) => {
-        const pos = oldAvatar.position.clone();
-        const rotY = oldAvatar.rotation.y;
-        this.scene.remove(oldAvatar);
+      this.remoteAvatars.forEach((entry, id) => {
+        const pos = entry.mesh.position.clone();
+        const rotY = entry.mesh.rotation.y;
+        this.scene.remove(entry.mesh);
 
-        const newAvatar = createSurvivorAvatarMesh('#06B6D4');
-        newAvatar.position.copy(pos);
-        newAvatar.rotation.y = rotY;
-        this.scene.add(newAvatar);
-        this.remoteAvatars.set(id, newAvatar);
+        const newMesh = createSurvivorAvatarMesh(entry.color, false, entry.name);
+        newMesh.position.copy(pos);
+        newMesh.rotation.y = rotY;
+        this.scene.add(newMesh);
+        entry.mesh = newMesh;
+        this.remoteAvatars.set(id, entry);
       });
       return;
     }
@@ -1435,6 +1589,7 @@ export class ThreeEngine {
     const nextIdx = (order.indexOf(this.currentWeather) + 1) % order.length;
     const next = order[nextIdx];
     this.setWeather(next, 55, true);
+    this.callbacks.onWeatherBroadcast?.(next);
     return next;
   }
 
@@ -1488,6 +1643,7 @@ export class ThreeEngine {
 
     // Damage node scaled by current weather's harvestSpeedMultiplier
     entry.node.health -= harvestDamage;
+    this.localHarvestActionTimer = 0.25;
     this.cameraShake = 0.04;
     this.hitstopTimer = 0.04;
     sound.playHarvest(entry.node.type);
@@ -1496,6 +1652,7 @@ export class ThreeEngine {
       const yieldRes = entry.node.yields.resource;
       const yieldAmt = entry.node.yields.amount;
       this.inventory[yieldRes] = (this.inventory[yieldRes] || 0) + yieldAmt;
+      this.callbacks.onResourceHarvested?.(targetId);
 
       if (entry.node.type === 'biomass') {
         // Biomass has NO in-place regeneration: permanently remove this node
@@ -2263,13 +2420,28 @@ export class ThreeEngine {
       this.updatePlayerMovement(dt);
       this.updateRaycastTarget();
       this.updateSurvivalSimulation(dt);
+      this.updateRemoteAvatarsAnimation(dt);
 
-      // Periodically broadcast player movement
-      if (Math.random() < 0.3) {
+      if (this.localHarvestActionTimer > 0) {
+        this.localHarvestActionTimer = Math.max(0, this.localHarvestActionTimer - dt);
+      }
+
+      // Broadcast player movement at a steady 20 Hz (every 50ms)
+      const now = performance.now();
+      if (now - this.lastNetBroadcastTime >= 50) {
+        this.lastNetBroadcastTime = now;
+        const isMovingKeys =
+          this.keysHeld.has('KeyW') ||
+          this.keysHeld.has('KeyS') ||
+          this.keysHeld.has('KeyA') ||
+          this.keysHeld.has('KeyD');
+        const currentAction =
+          this.localHarvestActionTimer > 0 ? 'harvest' : isMovingKeys ? 'walk' : 'idle';
         this.callbacks.onLocalPlayerMove(
           [this.playerPos.x, this.playerPos.y, this.playerPos.z],
           [this.playerPitch, this.playerYaw],
-          'idle'
+          currentAction,
+          this.vitals.health
         );
       }
     }
