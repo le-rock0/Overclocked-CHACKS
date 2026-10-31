@@ -10,6 +10,8 @@ import {
   StructureItem,
   StructureType,
   SurvivorVitals,
+  WeatherTelemetry,
+  WeatherType,
 } from '../types/game';
 import {
   groundTexture,
@@ -43,6 +45,7 @@ export interface EngineCallbacks {
   onTreeCut?: () => void;
   onWaterCollected?: () => void;
   onBuildModeChange?: (type: StructureType | null) => void;
+  onWeatherChange?: (telemetry: WeatherTelemetry) => void;
 }
 
 export class ThreeEngine {
@@ -143,13 +146,26 @@ export class ThreeEngine {
   public isAutoDayNight: boolean = true;
   private lastReportedMinute: number = -1;
 
-  // Pre-allocated colors for zero-GC day/night interpolation
+  // Dynamic Weather System State ('clear' | 'rain' | 'radiation_storm')
+  public currentWeather: WeatherType = 'clear';
+  public weatherTimer: number = 50; // Seconds until next automatic weather shift
+  public isSheltered: boolean = false;
+  public areMachinesSheltered: boolean = true;
+  private rainLines: THREE.LineSegments | null = null;
+  private radStormPoints: THREE.Points | null = null;
+  private lastWeatherNotifySec: number = -1;
+  private lastRadStormWarnSec: number = -1;
+
+  // Pre-allocated colors for zero-GC day/night & weather interpolation
   private readonly colDaySky = new THREE.Color(0x60a5fa);
   private readonly colDawnDuskSky = new THREE.Color(0xea580c);
   private readonly colNightSky = new THREE.Color(0x0b1528);
   private readonly colDaySun = new THREE.Color(0xfffbeb);
   private readonly colSunsetSun = new THREE.Color(0xfdba74);
   private readonly colNightMoon = new THREE.Color(0x7dd3fc);
+  private readonly colRainSky = new THREE.Color(0x334155);
+  private readonly colRadStormSky = new THREE.Color(0x365314);
+  private readonly colRadStormLight = new THREE.Color(0xa3e635);
   private readonly colWorkSky = new THREE.Color();
   private readonly colWorkLight = new THREE.Color();
 
@@ -232,11 +248,11 @@ export class ThreeEngine {
     this.moonOrbMesh = new THREE.Mesh(moonGeom, moonMat);
     this.scene.add(this.moonOrbMesh);
 
-    this.applyDayNightAtmosphere();
-
-    // 5. Build Procedural Terrain & Features
+    // 5. Build Procedural Terrain, Weather Particles & Features
     this.initTerrain();
+    this.initWeatherParticles();
     this.seedResourceNodes();
+    this.applyDayNightAtmosphere();
 
     // 6. First-Person Camera & Tool Assembly
     this.camera.position.copy(this.playerPos);
@@ -1144,30 +1160,88 @@ export class ThreeEngine {
     }
   };
 
+  private isMachineType(type: StructureType): boolean {
+    return (
+      type === 'cryo_stasis_pod' ||
+      type === 'nutrient_bioreactor' ||
+      type === 'gene_shifter_matrix' ||
+      type === 'rgshsc_core' ||
+      type === 'water_condenser' ||
+      type === 'solar_panel'
+    );
+  }
+
+  public isPositionUnderThermalRoof(x: number, z: number): boolean {
+    let covered = false;
+    this.structures.forEach(({ item }) => {
+      if (item.type === 'roof') {
+        const dx = Math.abs(item.position[0] - x);
+        const dz = Math.abs(item.position[2] - z);
+        if (dx <= 2.25 && dz <= 2.25) {
+          covered = true;
+        }
+      }
+    });
+    return covered;
+  }
+
+  public checkMachinesUnderThermalRoof(): boolean {
+    let machineCount = 0;
+    let shieldedCount = 0;
+    this.structures.forEach(({ item }) => {
+      if (this.isMachineType(item.type)) {
+        machineCount++;
+        if (this.isPositionUnderThermalRoof(item.position[0], item.position[2])) {
+          shieldedCount++;
+        }
+      }
+    });
+    // True if no machines built yet or all built machines are under a Thermal Roof
+    return machineCount === 0 || shieldedCount === machineCount;
+  }
+
   private handleInteractKey() {
     if (this.hoveredNodeId) {
       this.performHarvestAction();
     } else if (this.hoveredStructureId) {
       const struct = this.structures.get(this.hoveredStructureId);
-      if (struct && struct.item.type === 'rgshsc_core') {
+      if (!struct) return;
+
+      const isMachine = this.isMachineType(struct.item.type);
+      const isUnderRoof = this.isPositionUnderThermalRoof(
+        struct.item.position[0],
+        struct.item.position[2]
+      );
+
+      // If a Radiation Storm is active and this machine is NOT under a Thermal Roof, warn and block operation
+      if (isMachine && this.currentWeather === 'radiation_storm' && !isUnderRoof) {
+        sound.playDnaAlert();
+        this.callbacks.onNotification(
+          `${struct.item.type.replace('_', ' ').toUpperCase()} is exposed to the Radiation Storm! Build a Thermal Roof overhead so machines aren't affected!`,
+          'warn'
+        );
+        return;
+      }
+
+      if (struct.item.type === 'rgshsc_core') {
         this.triggerCloningRestoration();
-      } else if (struct && struct.item.type === 'campfire') {
+      } else if (struct.item.type === 'campfire') {
         this.vitals.dnaTemperature = Math.min(-15, this.vitals.dnaTemperature + 1);
         this.vitals.health = Math.min(100, this.vitals.health + 10);
         sound.playCraftComplete();
         this.callbacks.onNotification('Warmed near campfire. Health restored.', 'info');
-      } else if (struct && struct.item.type === 'water_condenser') {
+      } else if (struct.item.type === 'water_condenser') {
         this.inventory.purifiedWater += 1;
         this.callbacks.onInventoryChange({ ...this.inventory });
         sound.playHarvest('water');
         this.callbacks.onNotification('Collected 1x Purified Water', 'info');
         this.callbacks.onWaterCollected?.();
-      } else if (struct && struct.item.type === 'nutrient_bioreactor') {
+      } else if (struct.item.type === 'nutrient_bioreactor') {
         this.inventory.biomass = (this.inventory.biomass || 0) + 2;
         this.callbacks.onInventoryChange({ ...this.inventory });
         sound.playHarvest('biomass');
         this.callbacks.onNotification('Cultivated +2x Biomass from Nutrient Bioreactor', 'success');
-      } else if (struct && struct.item.type === 'solar_panel') {
+      } else if (struct.item.type === 'solar_panel') {
         this.inventory.scrapMetal = (this.inventory.scrapMetal || 0) + 1;
         this.inventory.quartzCrystal = (this.inventory.quartzCrystal || 0) + 1;
         this.callbacks.onInventoryChange({ ...this.inventory });
@@ -1237,9 +1311,146 @@ export class ThreeEngine {
     return `${s}s`;
   }
 
+  private initWeatherParticles() {
+    // 1. Rain Streak LineSegments (600 droplets in a local 44x24x44m box following the player)
+    const rainCount = 600;
+    const rainPositions = new Float32Array(rainCount * 6);
+    for (let i = 0; i < rainCount; i++) {
+      const rx = (Math.random() - 0.5) * 44;
+      const ry = Math.random() * 24;
+      const rz = (Math.random() - 0.5) * 44;
+      const idx = i * 6;
+      rainPositions[idx] = rx;
+      rainPositions[idx + 1] = ry;
+      rainPositions[idx + 2] = rz;
+      rainPositions[idx + 3] = rx - 0.12;
+      rainPositions[idx + 4] = ry - 0.85;
+      rainPositions[idx + 5] = rz - 0.08;
+    }
+    const rainGeom = new THREE.BufferGeometry();
+    rainGeom.setAttribute('position', new THREE.BufferAttribute(rainPositions, 3));
+    const rainMat = new THREE.LineBasicMaterial({
+      color: 0xbae6fd,
+      transparent: true,
+      opacity: 0.58,
+    });
+    this.rainLines = new THREE.LineSegments(rainGeom, rainMat);
+    this.rainLines.visible = false;
+    this.rainLines.frustumCulled = false;
+    this.scene.add(this.rainLines);
+
+    // 2. Radiation Storm Fallout Spores / Ash (550 glowing toxic particles swirling around the player)
+    const radCount = 550;
+    const radPositions = new Float32Array(radCount * 3);
+    for (let i = 0; i < radCount; i++) {
+      radPositions[i * 3] = (Math.random() - 0.5) * 48;
+      radPositions[i * 3 + 1] = Math.random() * 20;
+      radPositions[i * 3 + 2] = (Math.random() - 0.5) * 48;
+    }
+    const radGeom = new THREE.BufferGeometry();
+    radGeom.setAttribute('position', new THREE.BufferAttribute(radPositions, 3));
+    const radMat = new THREE.PointsMaterial({
+      color: 0xa3e635,
+      size: 0.18,
+      transparent: true,
+      opacity: 0.78,
+    });
+    this.radStormPoints = new THREE.Points(radGeom, radMat);
+    this.radStormPoints.visible = false;
+    this.radStormPoints.frustumCulled = false;
+    this.scene.add(this.radStormPoints);
+  }
+
+  public checkPlayerSheltered(): boolean {
+    // Player is completely sheltered when standing under a Thermal Roof
+    return this.isPositionUnderThermalRoof(this.playerPos.x, this.playerPos.z);
+  }
+
+  public getHarvestSpeedMultiplier(): number {
+    // If the player is under a Thermal Roof, they are completely unaffected by weather!
+    if (this.isSheltered) {
+      return 1.0;
+    }
+    if (this.currentWeather === 'rain') {
+      // Rain cools the multi-tool plasma emitter and softens flora/salvage (+25% harvesting speed)
+      return 1.25;
+    }
+    if (this.currentWeather === 'radiation_storm') {
+      // Ionizing radiation storm interferes with multi-tool beam (-40% harvesting speed when exposed)
+      return 0.6;
+    }
+    return 1.0;
+  }
+
+  public setWeather(weather: WeatherType, durationSecs: number = 50, notify: boolean = true) {
+    this.currentWeather = weather;
+    this.weatherTimer = durationSecs;
+    this.isSheltered = this.checkPlayerSheltered();
+    this.areMachinesSheltered = this.checkMachinesUnderThermalRoof();
+
+    if (this.rainLines) {
+      this.rainLines.visible = weather === 'rain';
+    }
+    if (this.radStormPoints) {
+      this.radStormPoints.visible = weather === 'radiation_storm';
+    }
+
+    // Update terrain wet/dry surface roughness
+    if (this.terrainMesh && this.terrainMesh.material instanceof THREE.MeshStandardMaterial) {
+      if (weather === 'rain') {
+        this.terrainMesh.material.roughness = 0.42;
+        this.terrainMesh.material.metalness = 0.28;
+      } else {
+        this.terrainMesh.material.roughness = 0.82;
+        this.terrainMesh.material.metalness = 0.12;
+      }
+    }
+
+    this.applyDayNightAtmosphere();
+    this.emitWeatherTelemetry();
+
+    if (notify) {
+      if (weather === 'clear') {
+        this.callbacks.onNotification(
+          'Weather Cleared: Skies stable (100% Harvest Speed, 0 Weather Hazard)',
+          'info'
+        );
+      } else if (weather === 'rain') {
+        this.callbacks.onNotification(
+          'Biosphere Rainshower: +25% Harvest Speed (125%), Hydration replenishing, 1.5x Sapling growth!',
+          'success'
+        );
+      } else if (weather === 'radiation_storm') {
+        sound.playDnaAlert();
+        this.callbacks.onNotification(
+          'WARNING — Radiation Storm! Stand under a Thermal Roof & cover machines with Thermal Roofs to stay unaffected!',
+          'warn'
+        );
+      }
+    }
+  }
+
+  public cycleWeather(): WeatherType {
+    const order: WeatherType[] = ['clear', 'rain', 'radiation_storm'];
+    const nextIdx = (order.indexOf(this.currentWeather) + 1) % order.length;
+    const next = order[nextIdx];
+    this.setWeather(next, 55, true);
+    return next;
+  }
+
+  private emitWeatherTelemetry() {
+    this.callbacks.onWeatherChange?.({
+      weather: this.currentWeather,
+      harvestSpeedMultiplier: this.getHarvestSpeedMultiplier(),
+      isSheltered: this.isSheltered,
+      areMachinesSheltered: this.areMachinesSheltered,
+      timeRemaining: Math.ceil(this.weatherTimer),
+    });
+  }
+
   private performHarvestAction() {
     if (this.equippedItem === 'tablet') {
-      this.callbacks.onNotification('Switch to Utility Weapon [1 / Q] to harvest resources!', 'info');
+      this.callbacks.onNotification('Switch to Pickaxe [1 / Q] to harvest resources!', 'info');
       return;
     }
     if (!this.hoveredNodeId) return;
@@ -1259,16 +1470,24 @@ export class ThreeEngine {
       return;
     }
 
-    // Harvest animation on tool
+    const harvestMult = this.getHarvestSpeedMultiplier();
+    const harvestDamage = Math.max(10, Math.round(35 * harvestMult));
+    const swingDurationMs = Math.round(95 / harvestMult);
+
+    // Pickaxe downward chopping swing animation (scales with weather harvest speed)
     if (this.fpToolGroup) {
-      this.fpToolGroup.position.z = -0.42; // recoil
+      this.fpToolGroup.rotation.x = -0.75; // chop downward
+      this.fpToolGroup.position.set(0.28, -0.38, -0.45);
       setTimeout(() => {
-        if (this.fpToolGroup) this.fpToolGroup.position.z = -0.55;
-      }, 70);
+        if (this.fpToolGroup) {
+          this.fpToolGroup.rotation.set(-0.2, 0.15, -0.08);
+          this.fpToolGroup.position.set(0.34, -0.32, -0.52);
+        }
+      }, swingDurationMs);
     }
 
-    // Damage node
-    entry.node.health -= 35;
+    // Damage node scaled by current weather's harvestSpeedMultiplier
+    entry.node.health -= harvestDamage;
     this.cameraShake = 0.04;
     this.hitstopTimer = 0.04;
     sound.playHarvest(entry.node.type);
@@ -1558,25 +1777,40 @@ export class ThreeEngine {
                 ? `Growing PLANTED SAPLING — ${pct}% (${this.formatRegenTime(rem)} left)`
                 : `Regenerating ${entry.node.type.toUpperCase()} — ${pct}% (${this.formatRegenTime(rem)} left)`;
             } else {
-              foundTarget = `[Left-Click / E] Harvest ${entry.node.type.toUpperCase()} (${entry.node.health}/${entry.node.maxHealth} HP)`;
+              const speedPct = Math.round(this.getHarvestSpeedMultiplier() * 100);
+              const speedTag =
+                speedPct !== 100 ? ` · ${speedPct}% Weather Speed` : '';
+              foundTarget = `[Left-Click / E] Harvest ${entry.node.type.toUpperCase()} (${Math.max(0, entry.node.health)}/${entry.node.maxHealth} HP${speedTag})`;
             }
           }
           break;
         } else if (obj.userData?.isStructure) {
           this.hoveredStructureId = obj.userData.id;
           const sType = obj.userData.type as StructureType;
+          const structEntry = this.structures.get(obj.userData.id);
+          const isShielded = structEntry
+            ? this.isPositionUnderThermalRoof(structEntry.item.position[0], structEntry.item.position[2])
+            : false;
+          const shieldBadge = this.isMachineType(sType)
+            ? isShielded
+              ? ' [SHIELDED BY THERMAL ROOF ✓]'
+              : this.currentWeather === 'radiation_storm'
+              ? ' [EXPOSED TO RAD STORM — ADD THERMAL ROOF!]'
+              : ' [UNROOFED]'
+            : '';
+
           if (sType === 'rgshsc_core') {
-            foundTarget = `[E] Examine RGSHSC Cloner (Stage ${this.clonerStage}/4) — ${this.clonerStage === 4 ? 'READY TO CLONE!' : 'Upgrade modules'}`;
+            foundTarget = `[E] Examine RGSHSC Cloner (Stage ${this.clonerStage}/4)${shieldBadge}`;
           } else if (sType === 'campfire') {
             foundTarget = `[E] Warm Self & Protect DNA at Campfire`;
           } else if (sType === 'water_condenser') {
-            foundTarget = `[E] Gather Purified Water`;
+            foundTarget = `[E] Gather Purified Water${shieldBadge}`;
           } else if (sType === 'nutrient_bioreactor') {
-            foundTarget = `[E] Cultivate +2x Biomass at Nutrient Bioreactor`;
+            foundTarget = `[E] Cultivate +2x Biomass at Nutrient Bioreactor${shieldBadge}`;
           } else if (sType === 'solar_panel') {
-            foundTarget = `[E] Synthesize +1x Scrap Metal & +1x Quartz Crystal`;
+            foundTarget = `[E] Synthesize +1x Scrap Metal & +1x Quartz Crystal${shieldBadge}`;
           } else {
-            foundTarget = `[E] Examine ${sType.replace('_', ' ').toUpperCase()}`;
+            foundTarget = `[E] Examine ${sType.replace('_', ' ').toUpperCase()}${shieldBadge}`;
           }
           break;
         }
@@ -1586,6 +1820,50 @@ export class ThreeEngine {
     }
 
     this.callbacks.onHoverTargetChange(foundTarget);
+  }
+
+  private updateWeatherParticles(dt: number) {
+    if (this.currentWeather === 'rain' && this.rainLines) {
+      this.rainLines.position.set(this.playerPos.x, this.playerPos.y - 4, this.playerPos.z);
+      const posAttr = this.rainLines.geometry.getAttribute('position') as THREE.BufferAttribute;
+      const arr = posAttr.array as Float32Array;
+      const fallStep = 22.0 * dt;
+      for (let i = 0; i < arr.length; i += 6) {
+        arr[i + 1] -= fallStep;
+        arr[i + 4] -= fallStep;
+        const wx = this.playerPos.x + arr[i];
+        const wz = this.playerPos.z + arr[i + 2];
+        const wy = this.playerPos.y - 4 + arr[i + 4];
+        // Block raindrops from falling underneath any placed Thermal Roof (roof canopy at y ~ ground + 2.6m)
+        const hitRoof =
+          wy < this.playerPos.y + 1.2 && this.isPositionUnderThermalRoof(wx, wz);
+        if (arr[i + 1] < 0 || hitRoof) {
+          const resetY = 22 + Math.random() * 2;
+          arr[i + 1] = resetY;
+          arr[i + 4] = resetY - 0.85;
+        }
+      }
+      posAttr.needsUpdate = true;
+    } else if (this.currentWeather === 'radiation_storm' && this.radStormPoints) {
+      this.radStormPoints.position.set(this.playerPos.x, this.playerPos.y - 3, this.playerPos.z);
+      const posAttr = this.radStormPoints.geometry.getAttribute('position') as THREE.BufferAttribute;
+      const arr = posAttr.array as Float32Array;
+      const windX = 5.5 * dt;
+      const sinkY = 2.6 * dt;
+      for (let i = 0; i < arr.length; i += 3) {
+        arr[i] += windX;
+        arr[i + 1] -= sinkY;
+        const wx = this.playerPos.x + arr[i];
+        const wz = this.playerPos.z + arr[i + 2];
+        const wy = this.playerPos.y - 3 + arr[i + 1];
+        // Block radiation fallout spores from entering underneath a Thermal Roof
+        const hitRoof =
+          wy < this.playerPos.y + 1.2 && this.isPositionUnderThermalRoof(wx, wz);
+        if (arr[i] > 24) arr[i] = -24;
+        if (arr[i + 1] < 0 || hitRoof) arr[i + 1] = 20;
+      }
+      posAttr.needsUpdate = true;
+    }
   }
 
   private updateResourceRegeneration(dt: number) {
@@ -1603,11 +1881,14 @@ export class ThreeEngine {
       }
     }
 
+    // Rain accelerates sapling and resource regrowth by 1.5x
+    const regenDt = this.currentWeather === 'rain' ? dt * 1.5 : dt;
+
     this.resourceNodes.forEach((entry, id) => {
       if (!entry.node.depleted) return;
 
       const dur = entry.node.respawnDuration || 30;
-      const nextTimer = (entry.node.respawnTimer ?? dur) - dt;
+      const nextTimer = (entry.node.respawnTimer ?? dur) - regenDt;
       const isSapling = Boolean(entry.mesh.userData?.isGrowingSapling);
 
       if (nextTimer <= 0) {
@@ -1670,7 +1951,69 @@ export class ThreeEngine {
     this.gameTime += dt;
     this.updateResourceRegeneration(dt);
 
-    // Hunger & Hydration gradual burn
+    // 1. Dynamic Weather Progression & Thermal Roof Shelter Check (Player + Machines)
+    const prevSheltered = this.isSheltered;
+    const prevMachinesSheltered = this.areMachinesSheltered;
+    this.isSheltered = this.checkPlayerSheltered();
+    this.areMachinesSheltered = this.checkMachinesUnderThermalRoof();
+    this.weatherTimer -= dt;
+    if (this.weatherTimer <= 0) {
+      // Automatically cycle weather: Clear -> Rain -> Radiation Storm -> Clear
+      const order: WeatherType[] = ['clear', 'rain', 'radiation_storm'];
+      const nextWeather = order[(order.indexOf(this.currentWeather) + 1) % order.length];
+      const nextDur = nextWeather === 'radiation_storm' ? 40 : 55;
+      this.setWeather(nextWeather, nextDur, true);
+    } else {
+      const wholeSec = Math.floor(this.gameTime);
+      if (
+        wholeSec !== this.lastWeatherNotifySec ||
+        prevSheltered !== this.isSheltered ||
+        prevMachinesSheltered !== this.areMachinesSheltered
+      ) {
+        this.lastWeatherNotifySec = wholeSec;
+        this.emitWeatherTelemetry();
+      }
+    }
+
+    // 2. Weather Impact on Player & Machines (Completely unaffected when under a Thermal Roof!)
+    if (this.currentWeather === 'rain') {
+      if (!this.isSheltered) {
+        // Exposed to Rain: replenishes Hydration and gently cleanses surface radiation
+        this.vitals.hydration = Math.min(100, this.vitals.hydration + dt * 0.45);
+        this.vitals.radiationExposure = Math.max(2, this.vitals.radiationExposure - dt * 0.3);
+      }
+    } else if (this.currentWeather === 'radiation_storm') {
+      // A) Player check: only affected if NOT under a Thermal Roof
+      if (!this.isSheltered) {
+        this.vitals.health = Math.max(0, this.vitals.health - dt * 1.35);
+        this.vitals.radiationExposure = Math.min(100, this.vitals.radiationExposure + dt * 1.8);
+
+        const nowSec = Math.floor(this.gameTime);
+        if (nowSec % 12 === 0 && nowSec !== this.lastRadStormWarnSec) {
+          this.lastRadStormWarnSec = nowSec;
+          sound.playDnaAlert();
+          this.callbacks.onNotification(
+            'RADIATION STORM: Stand under a Thermal Roof so you are not affected!',
+            'warn'
+          );
+        }
+      } else {
+        // Player is under a Thermal Roof: completely unaffected by the storm!
+        this.vitals.radiationExposure = Math.max(5, this.vitals.radiationExposure - dt * 0.5);
+      }
+
+      // B) Machines check: if Cloner machines are built but NOT under a Thermal Roof, storm affects DNA stability;
+      // if under a Thermal Roof, machines are 100% unaffected!
+      if (!this.areMachinesSheltered) {
+        this.vitals.dnaTemperature = Math.min(24, this.vitals.dnaTemperature + dt * 0.25);
+        this.vitals.dnaIntegrity = Math.max(0, this.vitals.dnaIntegrity - dt * 0.2);
+      }
+    } else {
+      // Clear weather: radiation slowly normalizes toward baseline 5%
+      this.vitals.radiationExposure = Math.max(5, this.vitals.radiationExposure - dt * 0.2);
+    }
+
+    // 3. Hunger & Hydration gradual burn
     this.vitals.hunger = Math.max(0, this.vitals.hunger - dt * 0.1);
     this.vitals.hydration = Math.max(0, this.vitals.hydration - dt * 0.15);
 
@@ -1679,15 +2022,15 @@ export class ThreeEngine {
       this.vitals.health = Math.max(0, this.vitals.health - dt * 0.5);
     }
 
-    // DNA Sample Stability Mechanics:
+    // 4. DNA Sample Stability Mechanics:
     // If no cryo-stasis chamber (Tier 1), temperature warms and DNA decays!
     if (this.clonerStage < 1) {
       this.vitals.dnaTemperature = Math.min(22, this.vitals.dnaTemperature + dt * 0.08);
       if (this.vitals.dnaTemperature > 0) {
         this.vitals.dnaIntegrity = Math.max(0, this.vitals.dnaIntegrity - dt * 0.25);
       }
-    } else {
-      // Locked in stasis at optimal -18°C!
+    } else if (this.currentWeather !== 'radiation_storm' || this.areMachinesSheltered) {
+      // Locked in stasis at optimal -18°C when Cryo-Stasis Chamber is shielded by a Thermal Roof (or not in a Rad Storm)!
       this.vitals.dnaTemperature = -18;
     }
 
@@ -1838,6 +2181,25 @@ export class ThreeEngine {
       fogDensity = 0.0125;
     }
 
+    // Apply Weather Atmospheric Tint & Fog Density Overrides
+    if (this.currentWeather === 'rain') {
+      this.colWorkSky.lerp(this.colRainSky, 0.65);
+      fogDensity += 0.0065;
+      if (this.sunLight) {
+        this.sunLight.intensity *= 0.6;
+      }
+    } else if (this.currentWeather === 'radiation_storm') {
+      this.colWorkSky.lerp(this.colRadStormSky, 0.75);
+      fogDensity += 0.0115;
+      if (this.sunLight) {
+        this.sunLight.color.lerp(this.colRadStormLight, 0.7);
+        this.sunLight.intensity *= 0.72;
+      }
+      if (this.ambientLight) {
+        this.ambientLight.color.setHex(0x84cc16);
+      }
+    }
+
     if (this.scene.background instanceof THREE.Color) {
       this.scene.background.copy(this.colWorkSky);
     } else {
@@ -1887,6 +2249,7 @@ export class ThreeEngine {
     }
 
     this.updateDayNightCycle(dt);
+    this.updateWeatherParticles(dt);
 
     // Title screen panoramic orbit when not playing
     if (!this.isPlaying) {

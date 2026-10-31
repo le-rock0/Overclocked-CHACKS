@@ -888,7 +888,7 @@ export function createSurvivorAvatarMesh(color: string = '#06B6D4', ignoreCustom
   return group;
 }
 
-// 16. First-Person Held Multi-Tool + Precious DNA Vial in Hand!
+// 16. First-Person Held Pickaxe + Cryo DNA Vial Mount on Shaft!
 export function createFirstPersonToolMesh(ignoreCustom: boolean = false): THREE.Group {
   if (!ignoreCustom) {
     const custom = customModelRegistry.createCustomInstance('fp_tool');
@@ -896,8 +896,16 @@ export function createFirstPersonToolMesh(ignoreCustom: boolean = false): THREE.
   }
   const group = new THREE.Group();
 
-  const metalMat = new THREE.MeshStandardMaterial({ color: 0x334155, roughness: 0.3, metalness: 0.8 });
-  const accentMat = new THREE.MeshStandardMaterial({ color: 0x06b6d4, roughness: 0.2, metalness: 0.9 });
+  const shaftMat = new THREE.MeshStandardMaterial({ color: 0x78350f, roughness: 0.75, metalness: 0.15 });
+  const gripMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.85, metalness: 0.2 });
+  const steelMat = new THREE.MeshStandardMaterial({ color: 0x475569, roughness: 0.32, metalness: 0.88 });
+  const edgeMat = new THREE.MeshStandardMaterial({
+    color: 0x06b6d4,
+    emissive: 0x0891b2,
+    emissiveIntensity: 0.45,
+    roughness: 0.2,
+    metalness: 0.9,
+  });
   const dnaGlassMat = new THREE.MeshPhysicalMaterial({
     color: 0x22d3ee,
     transmission: 0.9,
@@ -906,54 +914,81 @@ export function createFirstPersonToolMesh(ignoreCustom: boolean = false): THREE.
     opacity: 0.9,
   });
 
-  // Tool Chassis
-  const chassisGeom = new THREE.BoxGeometry(0.12, 0.14, 0.45);
-  const chassis = new THREE.Mesh(chassisGeom, metalMat);
-  chassis.position.set(0, 0, 0);
-  group.add(chassis);
+  // Pivot container tilted naturally like a held pickaxe in the right hand
+  const pickaxeRig = new THREE.Group();
 
-  // Laser Barrel
-  const barrelGeom = new THREE.CylinderGeometry(0.035, 0.045, 0.25, 8);
-  const barrel = new THREE.Mesh(barrelGeom, metalMat);
-  barrel.position.set(0, 0, -0.32);
-  barrel.rotation.x = Math.PI / 2;
-  group.add(barrel);
+  // 1. Main Wooden / Composite Pickaxe Handle Shaft
+  const shaftGeom = new THREE.CylinderGeometry(0.022, 0.026, 0.62, 10);
+  const shaft = new THREE.Mesh(shaftGeom, shaftMat);
+  shaft.position.set(0, 0.06, 0);
+  pickaxeRig.add(shaft);
 
-  // Laser Emitter Tip
-  const tipGeom = new THREE.CylinderGeometry(0.02, 0.035, 0.08, 8);
-  const tip = new THREE.Mesh(tipGeom, accentMat);
-  tip.position.set(0, 0, -0.47);
-  tip.rotation.x = Math.PI / 2;
-  group.add(tip);
+  // 2. Ergonomic Ribbed Grip Wrap & Steel Pommel Cap
+  const gripGeom = new THREE.CylinderGeometry(0.027, 0.029, 0.24, 10);
+  const grip = new THREE.Mesh(gripGeom, gripMat);
+  grip.position.set(0, -0.12, 0);
+  pickaxeRig.add(grip);
 
-  // Top Rail Cryogenic Chamber holding the DNA Vial
-  const mountGeom = new THREE.BoxGeometry(0.08, 0.04, 0.22);
-  const mount = new THREE.Mesh(mountGeom, metalMat);
-  mount.position.set(0, 0.09, -0.05);
-  group.add(mount);
+  const pommelGeom = new THREE.CylinderGeometry(0.034, 0.028, 0.04, 10);
+  const pommel = new THREE.Mesh(pommelGeom, steelMat);
+  pommel.position.set(0, -0.25, 0);
+  pickaxeRig.add(pommel);
 
-  // The precious Glowing DNA Sample Tube!
-  const dnaTubeGeom = new THREE.CylinderGeometry(0.025, 0.025, 0.2, 12);
+  // 3. Heavy Forged Steel Head Socket Collar at Top of Shaft
+  const collarGeom = new THREE.BoxGeometry(0.075, 0.09, 0.095);
+  const collar = new THREE.Mesh(collarGeom, steelMat);
+  collar.position.set(0, 0.34, 0);
+  pickaxeRig.add(collar);
+
+  // 4. Front Curved Pick Arm + Hardened Chisel Spike (pointing forward along -Z)
+  const frontArmGeom = new THREE.BoxGeometry(0.045, 0.055, 0.22);
+  const frontArm = new THREE.Mesh(frontArmGeom, steelMat);
+  frontArm.position.set(0, 0.335, -0.12);
+  frontArm.rotation.x = 0.16;
+  pickaxeRig.add(frontArm);
+
+  const spikeGeom = new THREE.ConeGeometry(0.032, 0.16, 6);
+  const spike = new THREE.Mesh(spikeGeom, edgeMat);
+  spike.position.set(0, 0.305, -0.28);
+  spike.rotation.x = -Math.PI / 2 + 0.24;
+  pickaxeRig.add(spike);
+
+  // 5. Rear Counter-Balanced Adze / Chisel Wedge (pointing backward along +Z)
+  const backArmGeom = new THREE.BoxGeometry(0.05, 0.05, 0.16);
+  const backArm = new THREE.Mesh(backArmGeom, steelMat);
+  backArm.position.set(0, 0.335, 0.10);
+  backArm.rotation.x = -0.12;
+  pickaxeRig.add(backArm);
+
+  const backBladeGeom = new THREE.BoxGeometry(0.075, 0.018, 0.07);
+  const backBlade = new THREE.Mesh(backBladeGeom, edgeMat);
+  backBlade.position.set(0, 0.322, 0.19);
+  backBlade.rotation.x = -0.18;
+  pickaxeRig.add(backBlade);
+
+  // 6. Side Cryo-Clamp holding the Glowing DNA Sample Vial along the shaft
+  const dnaTubeGeom = new THREE.CylinderGeometry(0.014, 0.014, 0.15, 10);
   const dnaTube = new THREE.Mesh(dnaTubeGeom, dnaGlassMat);
-  dnaTube.position.set(0, 0.13, -0.05);
-  dnaTube.rotation.x = Math.PI / 2;
-  group.add(dnaTube);
+  dnaTube.position.set(-0.034, 0.14, -0.01);
+  pickaxeRig.add(dnaTube);
 
-  // Glowing micro DNA core
-  const coreGeom = new THREE.CylinderGeometry(0.012, 0.012, 0.16, 6);
+  const coreGeom = new THREE.CylinderGeometry(0.007, 0.007, 0.12, 6);
   const coreMat = new THREE.MeshStandardMaterial({
     color: 0x38bdf8,
     emissive: 0x0284c7,
     emissiveIntensity: 1.0,
   });
   const core = new THREE.Mesh(coreGeom, coreMat);
-  core.position.set(0, 0.13, -0.05);
-  core.rotation.x = Math.PI / 2;
-  group.add(core);
+  core.position.set(-0.034, 0.14, -0.01);
+  pickaxeRig.add(core);
+
+  // Angle the pickaxe forward slightly in the player's hand
+  pickaxeRig.rotation.x = -0.35;
+  group.add(pickaxeRig);
 
   // Position in first-person camera space: lower right
-  group.position.set(0.3, -0.25, -0.55);
-  group.rotation.set(-0.1, 0.1, -0.05);
+  group.position.set(0.34, -0.32, -0.52);
+  group.rotation.set(-0.2, 0.15, -0.08);
 
   return group;
 }

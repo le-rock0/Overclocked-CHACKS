@@ -21,9 +21,12 @@ import {
   Wrench,
   Sprout,
   Utensils,
-  XCircle
+  XCircle,
+  CloudRain,
+  Radiation,
+  ShieldCheck
 } from 'lucide-react';
-import { EcoStats, EquippedItem, Inventory, StructureType, SurvivorVitals } from '../types/game';
+import { EcoStats, EquippedItem, Inventory, StructureType, SurvivorVitals, WeatherTelemetry } from '../types/game';
 
 interface HUDOverlayProps {
   vitals: SurvivorVitals;
@@ -43,6 +46,8 @@ interface HUDOverlayProps {
   isAutoDayNight: boolean;
   onCycleTimePreset: () => void;
   onToggleAutoDayNight: () => void;
+  weatherTelemetry: WeatherTelemetry;
+  onCycleWeather: () => void;
   isBuildDockCollapsed: boolean;
   onToggleBuildDock: () => void;
   notifications: Array<{ id: string; text: string; type: 'info' | 'warn' | 'success' }>;
@@ -72,6 +77,8 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
   timePhase,
   dayCount,
   onCycleTimePreset,
+  weatherTelemetry,
+  onCycleWeather,
   isBuildDockCollapsed,
   onToggleBuildDock,
   notifications,
@@ -88,6 +95,7 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
   const requiredSeeds = ecoStats.treesCut * 2;
   const seedsOwed = Math.max(0, requiredSeeds - ecoStats.seedsPlanted);
   const isOptimalTemp = vitals.dnaTemperature <= -15;
+  const harvestSpeedPct = Math.round(weatherTelemetry.harvestSpeedMultiplier * 100);
 
   const formatClock = (hr: number) => {
     const clean = ((hr % 24) + 24) % 24;
@@ -100,7 +108,7 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
 
   return (
     <div className="absolute inset-0 z-20 pointer-events-none flex flex-col justify-between p-3 md:p-4 select-none">
-      {/* TOP BAR: Compact Vitals + DNA Status on Left | Clock + Studio Tools on Right */}
+      {/* TOP BAR: Compact Vitals + DNA Status on Left | Clock + Weather + Studio Tools on Right */}
       <div className="flex items-start justify-between gap-3">
         {/* Top-Left: Streamlined Vitals + DNA Integrity + Mandate */}
         <div
@@ -176,11 +184,71 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
           </div>
         </div>
 
-        {/* Top-Right: Compact Single-Row Clock & Studio Actions */}
+        {/* Top-Right: Compact Single-Row Clock, Weather & Studio Actions */}
         <div
           onMouseDown={(e) => e.stopPropagation()}
           className="flex items-center gap-1.5 pointer-events-auto flex-wrap justify-end"
         >
+          {/* Dynamic Weather Toggle Button [G] */}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onCycleWeather();
+            }}
+            title="Click or press [G] to toggle Weather (Clear -> Rain -> Radiation Storm)"
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-mono-nums shadow-md transition-colors cursor-pointer ${
+              weatherTelemetry.weather === 'radiation_storm'
+                ? 'bg-lime-950/90 hover:bg-lime-900/90 border-lime-500/60 text-lime-300'
+                : weatherTelemetry.weather === 'rain'
+                ? 'bg-sky-950/90 hover:bg-sky-900/90 border-sky-500/50 text-sky-200'
+                : 'bg-slate-950/85 hover:bg-slate-900 border-slate-800 text-slate-200'
+            }`}
+          >
+            {weatherTelemetry.weather === 'radiation_storm' ? (
+              <Radiation className="w-3.5 h-3.5 text-lime-400 animate-spin" />
+            ) : weatherTelemetry.weather === 'rain' ? (
+              <CloudRain className="w-3.5 h-3.5 text-sky-400" />
+            ) : (
+              <Sun className="w-3.5 h-3.5 text-emerald-400" />
+            )}
+            <span className="font-bold">
+              {weatherTelemetry.weather === 'radiation_storm'
+                ? 'Rad Storm'
+                : weatherTelemetry.weather === 'rain'
+                ? 'Rain'
+                : 'Clear'}
+            </span>
+            <span
+              className={`text-[10px] px-1 py-0.2 rounded ${
+                harvestSpeedPct > 100
+                  ? 'bg-sky-500/20 text-sky-300'
+                  : harvestSpeedPct < 100
+                  ? 'bg-rose-500/20 text-rose-300'
+                  : 'bg-slate-800 text-slate-300'
+              }`}
+            >
+              {harvestSpeedPct}% Harvest
+            </span>
+            {weatherTelemetry.weather === 'radiation_storm' && (
+              <span
+                className={`text-[10px] font-bold flex items-center gap-0.5 ${
+                  weatherTelemetry.isSheltered ? 'text-emerald-300' : 'text-rose-400'
+                }`}
+              >
+                {weatherTelemetry.isSheltered ? (
+                  <>
+                    <ShieldCheck className="w-3 h-3" />
+                    <span>SHELTERED</span>
+                  </>
+                ) : (
+                  <span>EXPOSED -HP</span>
+                )}
+              </span>
+            )}
+            <span className="text-[10px] text-cyan-400">[G]</span>
+          </button>
+
           {/* Day/Night Clock Button */}
           <button
             type="button"
@@ -327,7 +395,7 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
               <button
                 type="button"
                 onClick={() => onSwitchEquipment('tool')}
-                title="Equip Utility Weapon / Multi-Tool [1]"
+                title="Equip Harvester Pickaxe [1]"
                 className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1 transition-colors cursor-pointer ${
                   equippedItem === 'tool'
                     ? 'bg-cyan-500 text-slate-950'
@@ -335,7 +403,7 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
                 }`}
               >
                 <Wrench className="w-3.5 h-3.5" />
-                <span>[1] Tool</span>
+                <span>[1] Pickaxe</span>
               </button>
 
               <button

@@ -20,6 +20,7 @@ import {
   RemoteSurvivor, 
   ChatMessage,
   TabletSDGMessage,
+  WeatherTelemetry,
 } from './types/game';
 import { customModelRegistry } from './game/customModelRegistry';
 import { sound } from './audio/soundEffects';
@@ -95,6 +96,12 @@ export default function App() {
   const [timePhase, setTimePhase] = useState('Daylight');
   const [dayCount, setDayCount] = useState(1);
   const [isAutoDayNight, setIsAutoDayNight] = useState(true);
+  const [weatherTelemetry, setWeatherTelemetry] = useState<WeatherTelemetry>({
+    weather: 'clear',
+    harvestSpeedMultiplier: 1.0,
+    isSheltered: false,
+    timeRemaining: 50,
+  });
 
   // Synchronized simulation states
   const [vitals, setVitals] = useState<SurvivorVitals>({
@@ -419,6 +426,9 @@ export default function App() {
       onBuildModeChange: (type) => {
         setActiveBuildType(type);
       },
+      onWeatherChange: (telemetry) => {
+        setWeatherTelemetry(telemetry);
+      },
     });
 
     engine.mount(mountRef.current);
@@ -586,6 +596,10 @@ export default function App() {
           engineRef.current.cycleTimePreset();
           setTimeOfDay(engineRef.current.timeOfDay);
           setTimePhase(engineRef.current.getPhaseLabel());
+        }
+      } else if (e.code === 'KeyG') {
+        if (engineRef.current) {
+          engineRef.current.cycleWeather();
         }
       } else if (e.code === 'KeyX' || e.code === 'KeyC') {
         if (activeBuildType || engineRef.current?.buildModeType) {
@@ -811,6 +825,12 @@ export default function App() {
     }
   };
 
+  const handleCycleWeather = () => {
+    if (engineRef.current) {
+      engineRef.current.cycleWeather();
+    }
+  };
+
   const handleApplyModelToWorld = (slotId: ModelSlotId, fileName: string) => {
     if (engineRef.current) {
       engineRef.current.refreshCustomModelSlot(slotId);
@@ -940,6 +960,8 @@ export default function App() {
             isAutoDayNight={isAutoDayNight}
             onCycleTimePreset={handleCycleTimePreset}
             onToggleAutoDayNight={handleToggleAutoDayNight}
+            weatherTelemetry={weatherTelemetry}
+            onCycleWeather={handleCycleWeather}
             isBuildDockCollapsed={isBuildDockCollapsed}
             onToggleBuildDock={() => setIsBuildDockCollapsed((prev) => !prev)}
             notifications={notifications}

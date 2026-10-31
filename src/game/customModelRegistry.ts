@@ -162,10 +162,10 @@ export const MODEL_SLOTS: ModelSlotMetadata[] = [
   },
   {
     slotId: 'fp_tool',
-    name: 'First-Person Multi-Tool & DNA Vial',
+    name: 'First-Person Harvester Pickaxe',
     category: 'avatar',
-    description: 'Handheld laser harvester and cryo-vial rig attached to player camera.',
-    canonicalSize: 0.65,
+    description: 'Handheld heavy mining pickaxe and cryo-DNA vial rig attached to player camera.',
+    canonicalSize: 0.72,
     groundPivot: false,
   },
 ];

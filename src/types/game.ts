@@ -49,6 +49,16 @@ export interface SurvivorVitals {
   radiationExposure: number; // 0 - 100%
 }
 
+export type WeatherType = 'clear' | 'rain' | 'radiation_storm';
+
+export interface WeatherTelemetry {
+  weather: WeatherType;
+  harvestSpeedMultiplier: number;
+  isSheltered: boolean;
+  areMachinesSheltered: boolean;
+  timeRemaining: number;
+}
+
 export type StructureType = 
   | 'foundation'
   | 'wall'
