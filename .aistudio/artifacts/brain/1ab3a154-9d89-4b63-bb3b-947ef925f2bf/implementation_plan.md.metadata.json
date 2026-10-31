@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for an in-game 3D Model Studio & Drag-and-Drop Importer (.glb, .gltf, .obj) in RGSHSC: The Last Strand, supporting custom models for buildable structures, RGSHSC Cloner tiers, survivor avatars, and harvestable world resources with interactive scale, rotation, ground-offset, and PBR material override controls.",
+  "updatedAt":  "2026-10-30T13:51:30.146213310Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

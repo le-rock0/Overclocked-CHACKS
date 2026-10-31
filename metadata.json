@@ -1,0 +1,8 @@
+{
+  "name": "RGSHSC: The Last Strand 1",
+  "description": "First-person 3D multiplayer survival game where you safeguard humanity\u0027s final DNA sample, scavenge, build shelter, construct the Reproductive Gene Shifting Homo Sapien Cloner, and export assets to Unity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
